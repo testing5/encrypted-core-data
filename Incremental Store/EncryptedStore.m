@@ -12,6 +12,8 @@
 #import <objc/runtime.h>
 
 #import "EncryptedStore.h"
+#import "YapDatabaseCryptoUtils.h"
+#import "YapDatabaseOptions.h"
 
 typedef sqlite3_stmt sqlite3_statement;
 
@@ -1181,8 +1183,9 @@ static const NSInteger kTableCheckVersion = 1;
 
 - (BOOL)setDatabasePassphrase:(NSString *)passphrase error:(NSError *__autoreleasing*)error {
     BOOL result;
+    
+    /*
     int status;
-
     if ([passphrase length] > 0) {
         // Password provided, use it to key the DB
         // Password provided, use it to key the DB
@@ -1192,14 +1195,216 @@ static const NSInteger kTableCheckVersion = 1;
         // No password
         status = SQLITE_OK;
     }
-
     result = status == SQLITE_OK;
+     */
+    
+    result = [self configureEncryptionForDatabase: database passphrase: passphrase];
     
     if (result) {
         result = [self checkDatabaseStatusWithError:error];
     }
 
     return result && (error == NULL || *error == nil);
+}
+
+/**
+ * Configures database encryption via SQLCipher.
+ * cipherUnencryptedHeader
+**/
+- (BOOL)configureEncryptionForDatabase:(sqlite3 *)sqlite passphrase:(NSString *) passphrase
+{
+    YapDatabaseOptions *options = [[YapDatabaseOptions alloc]init];
+    options.cipherUnencryptedHeaderLength = kSqliteHeaderLength;
+    
+    options.cipherKeySpecBlock = ^{
+        // NOTE: It's critical that we don't capture a reference to self
+        // (e.g. by using OWSAssertDebug()) or this database will contain a
+        // circular reference and will leak.
+        
+        // Rather than compute this once and capture the value of the key
+        // in the closure, we prefer to fetch the key from the keychain multiple times
+        // in order to keep the key out of application memory.
+        NSData *databaseKeySpec = [[NSData alloc] initWithBase64EncodedString:passphrase options:0];
+        NSAssert(databaseKeySpec.length == kSQLCipherKeySpecLength, @"databaseKeySpec length now right");
+        return databaseKeySpec;
+    };
+    
+    // Option A:
+    if (options.cipherUnencryptedHeaderLength > 0) {
+        if (options.cipherKeySpecBlock)
+        {
+            // Do nothing.
+        } else if (!(options.cipherKeyBlock && options.cipherSaltBlock)) {
+            NSAssert(NO, @"If you're using YapDatabaseOptions.cipherUnencryptedHeaderLength, you need to set either cipherKeySpecBlock or both cipherKeyBlock and cipherSaltBlock.");
+            return NO;
+        }
+    }
+    
+    // Option B:
+    if (options.cipherKeyBlock ||
+        options.cipherKeySpecBlock)
+    {
+        NSData *_Nullable keyData = nil;
+        if (options.cipherKeySpecBlock)
+        {
+            if (options.cipherKeyBlock) {
+                NSAssert(NO, @"If you're using YapDatabaseOptions.cipherKeySpecBlock, you don't need to set a cipherKeySpecBlock.");
+                return NO;
+            }
+            if (options.cipherSaltBlock) {
+                NSAssert(NO, @"If you're using YapDatabaseOptions.cipherKeySpecBlock, you don't need to set a cipherSaltBlock.");
+                return NO;
+            }
+
+            NSData *_Nullable keySpecData = options.cipherKeySpecBlock();
+            if (!keySpecData)
+            {
+                NSAssert(NO, @"YapDatabaseOptions.cipherKeySpecBlock cannot return nil!");
+                return NO;
+            }
+            if (keySpecData.length != kSQLCipherKeySpecLength) {
+                NSAssert(NO, @"YapDatabaseOptions.cipherKeySpecBlock returned a key spec of unexpected length: %zd.", keySpecData.length);
+                return NO;
+            }
+
+            // Use a raw key spec, where the 96 hexadecimal digits are provided
+            // (i.e. 64 hex for the 256 bit key, followed by 32 hex for the 128 bit salt)
+            // using explicit BLOB syntax, e.g.:
+            //
+            // x'98483C6EB40B6C31A448C22A66DED3B5E5E8D5119CAC8327B655C8B5C483648101010101010101010101010101010101'
+            NSString *keySpecString = [NSString stringWithFormat:@"x'%@'", [self hexadecimalStringForData:keySpecData]];
+            keyData = [keySpecString dataUsingEncoding:NSUTF8StringEncoding];
+        } else {
+            keyData = options.cipherKeyBlock();
+            if (!keyData)
+            {
+                NSAssert(NO, @"YapDatabaseOptions.cipherKeyBlock cannot return nil!");
+                return NO;
+            }
+        }
+        
+        
+        //Setting the PBKDF2 default iteration number (this will have effect next time database is opened)
+        if (options.cipherDefaultkdfIterNumber > 0) {
+            char *errorMsg;
+            NSString *pragmaCommand = [NSString stringWithFormat:@"PRAGMA cipher_default_kdf_iter = %lu", (unsigned long)options.cipherDefaultkdfIterNumber];
+            if (sqlite3_exec(sqlite, [pragmaCommand UTF8String], NULL, NULL, &errorMsg) != SQLITE_OK)
+            {
+                NSLog(@"failed to set database cipher_default_kdf_iter: %s", errorMsg);
+                return NO;
+            }
+        }
+        
+        //Setting the PBKDF2 iteration number
+        if (options.kdfIterNumber > 0) {
+            char *errorMsg;
+            NSString *pragmaCommand = [NSString stringWithFormat:@"PRAGMA kdf_iter = %lu", (unsigned long)options.kdfIterNumber];
+            if (sqlite3_exec(sqlite, [pragmaCommand UTF8String], NULL, NULL, &errorMsg) != SQLITE_OK)
+            {
+                NSLog(@"failed to set database kdf_iter: %s", errorMsg);
+                return NO;
+            }
+        }
+        
+        //Setting the encrypted database page size
+        if (options.cipherPageSize > 0) {
+            char *errorMsg;
+            NSString *pragmaCommand = [NSString stringWithFormat:@"PRAGMA cipher_page_size = %lu", (unsigned long)options.cipherPageSize];
+            if (sqlite3_exec(sqlite, [pragmaCommand UTF8String], NULL, NULL, &errorMsg) != SQLITE_OK)
+            {
+                NSLog(@"failed to set database cipher_page_size: %s", errorMsg);
+                return NO;
+            }
+        }
+        
+        int status = sqlite3_key(sqlite, [keyData bytes], (int)[keyData length]);
+        if (status != SQLITE_OK)
+        {
+            NSLog(@"Error setting SQLCipher key: %d %s", status, sqlite3_errmsg(sqlite));
+            return NO;
+        }
+        
+        if (options.cipherUnencryptedHeaderLength > 0 &&
+            (options.cipherKeySpecBlock ||
+             options.cipherSaltBlock)) {
+             
+            if (options.cipherKeySpecBlock) {
+                // YapDatabase using cipher key spec and unencrypted header.
+            } else {
+                // YapDatabase using cipher salt and unencrypted header.
+                
+                NSData *_Nullable saltData = options.cipherSaltBlock();
+                
+                if (saltData == nil)
+                {
+                    NSAssert(NO, @"YapDatabaseOptions.cipherSaltBlock cannot return nil!");
+                    return NO;
+                }
+                if (saltData.length != kSQLCipherSaltLength) {
+                    NSAssert(NO, @"YapDatabaseOptions.cipherSaltBlock returned a salt of unexpected length: %zd.", saltData.length);
+                    return NO;
+                }
+
+                {
+                    char *errorMsg;
+                    // Example: PRAGMA cipher_salt = "x'01010101010101010101010101010101';";
+                    NSString *pragmaSql = [NSString stringWithFormat:@"PRAGMA cipher_salt = \"x'%@'\";", [self hexadecimalStringForData:saltData]];
+                    if (sqlite3_exec(sqlite, [pragmaSql UTF8String], NULL, NULL, &errorMsg) != SQLITE_OK)
+                    {
+                        NSLog(@"failed to set database cipher_default_kdf_iter: %s", errorMsg);
+                        return NO;
+                    }
+                }
+            }
+            
+            {
+                // We use cipher_plaintext_header_size NOT cipher_default_plaintext_header_size,
+                // since the _default_ pragma affects a static variable.
+                NSString *pragmaSql =
+                [NSString stringWithFormat:@"PRAGMA cipher_plaintext_header_size = %zd;", options.cipherUnencryptedHeaderLength];
+                int status = sqlite3_exec(sqlite, [pragmaSql UTF8String], NULL, NULL, NULL);
+                if (status != SQLITE_OK) {
+                    NSLog(@"Error setting PRAGMA cipher_plaintext_header_size = %zd: status: %d, error: %s",
+                                options.cipherUnencryptedHeaderLength,
+                                status,
+                                sqlite3_errmsg(sqlite));
+                    return NO;
+                }
+            }
+        } else {
+            if (options.cipherUnencryptedHeaderLength > 0) {
+                NSAssert(NO, @"YapDatabaseOptions.cipherUnencryptedHeaderLength should not be used without cipherKeySpecBlock or cipherSaltBlock!");
+                return NO;
+            }
+            if (options.cipherKeySpecBlock) {
+                NSAssert(NO, @"YapDatabaseOptions.cipherKeySpecBlock should not be used without setting cipherUnencryptedHeaderLength!");
+                return NO;
+            }
+            if (options.cipherSaltBlock) {
+                NSAssert(NO, @"YapDatabaseOptions.cipherSaltBlock should not be used without setting cipherUnencryptedHeaderLength!");
+                return NO;
+            }
+        }
+    }
+    
+    return YES;
+}
+
+
+- (NSString *)hexadecimalStringForData:(NSData *)data {
+    /* Returns hexadecimal string of NSData. Empty string if data is empty. */
+    const unsigned char *dataBuffer = (const unsigned char *)[data bytes];
+    if (!dataBuffer) {
+        return @"";
+    }
+        
+    NSUInteger dataLength = [data length];
+    NSMutableString *hexString = [NSMutableString stringWithCapacity:(dataLength * 2)];
+    
+    for (NSUInteger i = 0; i < dataLength; ++i) {
+        [hexString appendFormat:@"%02x", dataBuffer[i]];
+    }
+    return [hexString copy];
 }
 
 - (BOOL)validateDatabasePassphrase:(NSString *)passphrase error:(NSError *__autoreleasing*)error {
