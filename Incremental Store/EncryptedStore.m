@@ -2600,9 +2600,14 @@ static void dbsqliteStripCaseDiacritics(sqlite3_context *context, int argc, cons
     
     NSMutableDictionary *localNodeCache = [nodeCache mutableCopy];
     BOOL success = [self performInTransaction:^{
-        BOOL insert = [self handleInsertedObjectsInSaveRequest:request error:error];
-        BOOL update = [self handleUpdatedObjectsInSaveRequest:request cache:localNodeCache error:error];
-        BOOL delete = [self handleDeletedObjectsInSaveRequest:request error:error];
+       BOOL insert, update, delete;
+        insert = [self handleInsertedObjectsInSaveRequest:request error:error];
+        if (insert == YES) {
+            update = [self handleUpdatedObjectsInSaveRequest:request cache:localNodeCache error:error];
+        }
+        if (delete == YES) {
+            delete = [self handleDeletedObjectsInSaveRequest:request error:error];
+        }
         return (BOOL)(insert && update && delete);
     }];
     if (success) {
