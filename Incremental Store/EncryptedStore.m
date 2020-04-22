@@ -2600,12 +2600,15 @@ static void dbsqliteStripCaseDiacritics(sqlite3_context *context, int argc, cons
     
     NSMutableDictionary *localNodeCache = [nodeCache mutableCopy];
     BOOL success = [self performInTransaction:^{
-       BOOL insert, update, delete;
+        BOOL insert = NO;
+        BOOL update = NO;
+        BOOL delete = NO;
+        
         insert = [self handleInsertedObjectsInSaveRequest:request error:error];
-        if (insert == YES) {
+        if (insert) {
             update = [self handleUpdatedObjectsInSaveRequest:request cache:localNodeCache error:error];
         }
-        if (delete == YES) {
+        if (update) {
             delete = [self handleDeletedObjectsInSaveRequest:request error:error];
         }
         return (BOOL)(insert && update && delete);
@@ -3162,10 +3165,13 @@ static void dbsqliteStripCaseDiacritics(sqlite3_context *context, int argc, cons
         NSDictionary *userInfo = @{
                                    EncryptedStoreErrorMessageKey : [NSString stringWithUTF8String:sqlite3_errmsg(database)]
                                    };
-        return [NSError
+        
+        NSError *error = [NSError
                 errorWithDomain:NSSQLiteErrorDomain
                 code:code
                 userInfo:userInfo];
+        NSLog(@"databaseError: %@", error);
+        return error;
     }
     return nil;
 }
